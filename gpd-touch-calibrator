@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""GPD Pocket 3 (Omarchy / Hyprland) touchscreen calibrator.
+
+Shows fullscreen targets, records where touches actually land and fits a
+correction made of two parts:
+
+- rotation / flip: Hyprland's input:touchdevice:transform. Hyprland always sets
+  the libinput calibration matrix from it (0 = identity when unset), so a udev
+  LIBINPUT_CALIBRATION_MATRIX never takes effect.
+- per-axis scale / offset: the kernel's absolute axis ranges, overridden via
+  udev EVDEV_ABS_xx. libinput normalizes touches against these ranges before
+  the transform is applied.
+
+Touch position on screen (normalized) = T · S · h, where h is the raw touch
+normalized against the panel's original ranges, S the installed axis scale and
+T the transform matrix.
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+APPLY_HELPER_CANDIDATES = [
+    os.path.join(HERE, "gpd-touch-calibrator-apply"),
+    "/usr/local/bin/gpd-touch-calibrator-apply",
+]
+IDENTITY_SCALE = [1.0, 0.0, 1.0, 0.0]  # sx, cx, sy, cy
+RULE_PATH = "/etc/udev/rules.d/99-gpd-touch-calibration.rules"
+RULE_MARK = "# gpd-touch-calibrator: "
+HYPR_DIR = os.path.expanduser("~/.config/hypr")
+HYPR_MODULE = os.path.join(HYPR_DIR, "touch_calibration.lua")
+HYPR_REQUIRE = 'require("hypr.touch_calibration")'
+
+# Hyprland's touch transform matrices (src/managers/input/InputManager.hpp).
+# The config option only accepts 0-6.
+TRANSFORMS = [
+    [1, 0, 0, 0, 1, 0],    # normal
+    [0, -1, 1, 1, 0, 0],   # 90°
+    [-1, 0, 1, 0, -1, 1],  # 180°
+    [0, 1, 0, -1, 0, 1],   # 270°
+    [-1, 0, 1, 0, 1, 0],   # flipped
+    [0, 1, 0, 1, 0, 0],    # flipped + 90°
+    [1, 0, 0, 0, -1, 1],   # flipped + 180°
+]
+# UI messages: key -> (English, Japanese). Selected by --lang or the locale.
+MESSAGES = {
+    "no_hyprland_lua": ("hyprland.lua not found. Set input:touchdevice:transform = {t} manually",
+                        "hyprland.lua が見つかりません。input:touchdevice:transform = {t} を手動で設定してください"),
+    "hypr_config_error": ("Hyprland config error: {error}", "Hyprland の設定エラー: {error}"),
+    "btn_apply": ("Apply (Enter)", "適用 (Enter)"),
+    "btn_retry": ("Retry (R)", "やり直し (R)"),
+    "btn_quit": ("Quit (Esc)", "終了 (Esc)"),
+    "fit_failed": ("Calculation failed. Press R to retry.", "計算に失敗しました。R でやり直してください。"),
+    "verdict_unknown": ("Cannot judge (press R to retry)", "判定できません（R でやり直してください）"),
+    "verdict_good": ("Good (recalibrating would not improve it)",
+                     "良好（再キャリブレーションしても改善しません）"),
+    "verdict_improve": ("Recalibration would improve it (RMS {rms:.1f} → {fit:.1f} px)",
+                        "再キャリブレーションで改善します（RMS {rms:.1f} → {fit:.1f} px）"),
+    "dry_run": ("--dry-run: not applied (settings printed to stdout)",
+                "--dry-run: 適用はスキップしました（設定は標準出力に表示）"),
+    "no_touchscreen": ("Touchscreen not found (Esc to quit)", "タッチスクリーンが見つかりません（Escで終了）"),
+    "check_banner": ("Check mode (settings are not changed)", "確認モード（設定は変更しません）"),
+    "touch_target": ("Touch the center of the red cross and lift  {n}/{total}",
+                     "赤い十字の中心をタッチして離してください  {n}/{total}"),
+    "collect_keys": ("Backspace: back one   Esc: quit", "Backspace: ひとつ戻る   Esc: 終了"),
+    "applied": ("Applied. Closing in a few seconds.", "適用しました。数秒後に終了します。"),
+    "verify_title": ("Test: touch the screen to see the corrected position (green)",
+                     "テスト: 画面をタッチすると補正後の位置（緑）を表示します"),
+    "verify_legend": ("Gray = current position   Green = corrected position",
+                      "灰色 = 現在の位置   緑 = 補正後の位置"),
+    "fit_error": ("Fit error (RMS): {fit:.1f} px", "フィット誤差 (RMS): {fit:.1f} px"),
+    "new_setting": ("New settings: {setting}", "新しい設定: {setting}"),
+    "check_title": ("Check mode: error of the current calibration", "確認モード: 現在のキャリブレーションの誤差"),
+    "check_stats": ("Mean {mean:.1f} px   Max {worst:.1f} px   RMS {rms:.1f} px   → {verdict}",
+                    "平均 {mean:.1f} px   最大 {worst:.1f} px   RMS {rms:.1f} px   → {verdict}"),
+    "check_estimate": ("Estimated error after recalibration (RMS): {fit:.1f} px",
+                       "再キャリブレーションした場合の推定誤差 (RMS): {fit:.1f} px"),
+    "current_setting": ("Current settings: {setting}", "現在の設定: {setting}"),
+    "check_legend": ("Red = where each target touch landed   Gray = your touches (free test)",
+                     "赤 = 各ターゲットでのタッチ位置   灰色 = タッチした位置（自由にテスト）"),
+    "no_helper": ("gpd-touch-calibrator-apply not found", "gpd-touch-calibrator-apply が見つかりません"),
+    "helper_failed": ("Failed ({code}): {output}", "失敗しました ({code}): {output}"),
+}
+
+
+def detect_language():
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(var)
+        if value:
+            return "ja" if value.startswith("ja") else "en"
+    return "en"
+
+
+LANGUAGE = detect_language()
+
+
+def _(key, **kw):
+    en, ja = MESSAGES[key]
+    return (ja if LANGUAGE == "ja" else en).format(**kw)
+
+
+TRANSFORM_NAMES = ["0 (normal)", "1 (90°)", "2 (180°)", "3 (270°)",
+                   "4 (flipped)", "5 (flipped+90°)", "6 (flipped+180°)"]
+
+TARGETS_5 = [(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9), (0.5, 0.5)]
+TARGETS_9 = [(x, y) for y in (0.08, 0.5, 0.92) for x in (0.08, 0.5, 0.92)]
+
+
+# ---------------------------------------------------------------- device ---
+
+def udev_props(devnode):
+    out = subprocess.run(["udevadm", "info", "-q", "property", "-n", devnode],
+                         capture_output=True, text=True).stdout
+    props = {}
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        props[k] = v
+    return props
+
+
+def find_touchscreen(preferred=None):
+    """Return (eventN, name, props) of the touchscreen."""
+    candidates = []
+    for path in sorted(glob.glob("/sys/class/input/event*")):
+        ev = os.path.basename(path)
+        if preferred and ev != preferred:
+            continue
+        props = udev_props(f"/dev/input/{ev}")
+        if props.get("ID_INPUT_TOUCHSCREEN") != "1" or props.get("ID_INPUT_TABLET") == "1":
+            continue
+        try:
+            with open(os.path.join(path, "device", "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        candidates.append((ev, name, props))
+    if not candidates:
+        return None
+    # Prefer the GPD Pocket 3's Goodix panel.
+    candidates.sort(key=lambda c: "GXTP7380" not in c[1])
+    return candidates[0]
+
+
+def installed_scale():
+    """Per-axis scale/offset installed via EVDEV_ABS (identity if none)."""
+    try:
+        with open(RULE_PATH) as f:
+            for line in f:
+                if line.startswith(RULE_MARK):
+                    scale = json.loads(line[len(RULE_MARK):])["scale"]
+                    if len(scale) == 4:
+                        return [float(v) for v in scale]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return list(IDENTITY_SCALE)
+
+
+def hyprland_touch_transform():
+    try:
+        out = subprocess.run(["hyprctl", "-j", "getoption", "input:touchdevice:transform"],
+                             capture_output=True, text=True, timeout=2).stdout
+        t = int(json.loads(out).get("int", 0))
+    except Exception:
+        return 0
+    return t if 0 <= t < len(TRANSFORMS) else 0
+
+
+def hypr_reload():
+    """Reload Hyprland; return its config errors (empty string if none)."""
+    subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=5)
+    out = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True,
+                         timeout=5).stdout.strip()
+    return "" if out.lower() in ("", "no errors", "ok") else out
+
+
+def set_hypr_transform(t):
+    """Persist input:touchdevice:transform in a module required from hyprland.lua."""
+    main = os.path.join(HYPR_DIR, "hyprland.lua")
+    if not os.path.exists(main):
+        return False, _("no_hyprland_lua", t=t)
+    with open(HYPR_MODULE, "w") as f:
+        f.write("-- Generated by gpd-touch-calibrator. Touchscreen rotation; re-run the\n"
+                "-- calibrator instead of editing this by hand.\n"
+                f"hl.config({{ input = {{ touchdevice = {{ transform = {t} }} }} }})\n")
+    with open(main) as f:
+        text = f.read()
+    if HYPR_REQUIRE not in text:
+        shutil.copy2(main, f"{main}.bak.{int(time.time())}")
+        with open(main, "a") as f:
+            f.write(f"\n-- Touchscreen rotation managed by gpd-touch-calibrator.\n{HYPR_REQUIRE}\n")
+    errors = hypr_reload()
+    return (False, _("hypr_config_error", error=errors.splitlines()[0])) if errors else (True, "")
+
+
+def remove_hypr_transform():
+    main = os.path.join(HYPR_DIR, "hyprland.lua")
+    if os.path.exists(main):
+        with open(main) as f:
+            lines = f.read().splitlines(keepends=True)
+        kept = [l for l in lines if HYPR_REQUIRE not in l and "managed by gpd-touch-calibrator" not in l]
+        if kept != lines:
+            with open(main, "w") as f:
+                f.writelines(kept)
+    if os.path.exists(HYPR_MODULE):
+        os.remove(HYPR_MODULE)
+    return hypr_reload()
+
+
+# ------------------------------------------------------------------ math ---
+
+def apply_affine(m, x, y):
+    return (m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5])
+
+
+def invert_affine(m):
+    a, b, c, d, e, f = m
+    det = a * e - b * d
+    if abs(det) < 1e-12:
+        raise ValueError("singular")
+    return [e / det, -b / det, (b * f - c * e) / det, -d / det, a / det, (c * d - a * f) / det]
+
+
+def scale_affine(s):
+    sx, cx, sy, cy = s
+    return [sx, 0.0, cx, 0.0, sy, cy]
+
+
+def fit_line(xs, ys):
+    """Least-squares y ≈ s·x + c."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    var = sum((x - mx) ** 2 for x in xs)
+    if var < 1e-9:
+        raise ValueError("degenerate")
+    s = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var
+    return s, my - s * mx
+
+
+def fit_calibration(hw, targets, w, h):
+    """Best (transform, scale, rms_px) with target ≈ TRANSFORMS[t]·scale·hw."""
+    best = None
+    for t, m in enumerate(TRANSFORMS):
+        inv = invert_affine(m)
+        want = [apply_affine(inv, *p) for p in targets]
+        sx, cx = fit_line([p[0] for p in hw], [q[0] for q in want])
+        sy, cy = fit_line([p[1] for p in hw], [q[1] for q in want])
+        if sx <= 0 or sy <= 0:
+            continue
+        full = compose(m, scale_affine([sx, cx, sy, cy]))
+        err = [math.hypot((u - tx) * w, (v - ty) * h)
+               for (u, v), (tx, ty) in ((apply_affine(full, *p), t_) for p, t_ in zip(hw, targets))]
+        rms = math.sqrt(sum(e * e for e in err) / len(err))
+        if best is None or rms < best[2]:
+            best = (t, [sx, cx, sy, cy], rms)
+    if best is None:
+        raise ValueError("no fit")
+    return best
+
+
+def compose(a, b):
+    """Return a∘b (apply b first, then a) for 2x3 affine matrices."""
+    return [
+        a[0] * b[0] + a[1] * b[3], a[0] * b[1] + a[1] * b[4], a[0] * b[2] + a[1] * b[5] + a[2],
+        a[3] * b[0] + a[4] * b[3], a[3] * b[1] + a[4] * b[4], a[3] * b[2] + a[4] * b[5] + a[5],
+    ]
+
+
+def fmt_scale(s):
+    return " ".join(f"{v:.6f}" for v in s)
+
+
+def fmt_setting(t, s):
+    return (f"transform {TRANSFORM_NAMES[t]}   "
+            f"x: ×{s[0]:.4f} {s[1]:+.4f}   y: ×{s[2]:.4f} {s[3]:+.4f}")
+
+
+# -------------------------------------------------------------------- UI ---
+
+class Calibrator(Gtk.ApplicationWindow):
+    COLLECT, VERIFY, DONE = range(3)
+
+    def __init__(self, app, args):
+        super().__init__(application=app, title="Touch Calibrator")
+        self.args = args
+        self.targets = TARGETS_9 if args.points == 9 else TARGETS_5
+        self.device = find_touchscreen(args.device)
+        self.cur_transform = hyprland_touch_transform()
+        self.cur_scale = installed_scale()
+        # Screen position -> raw touch normalized against the original ranges.
+        self.to_hw = invert_affine(compose(TRANSFORMS[self.cur_transform], scale_affine(self.cur_scale)))
+        self.reset_state()
+
+        self.set_decorated(False)
+        overlay = Gtk.Overlay()
+        self.set_child(overlay)
+
+        self.area = Gtk.DrawingArea(hexpand=True, vexpand=True)
+        self.area.set_draw_func(self.on_draw)
+        overlay.set_child(self.area)
+
+        legacy = Gtk.EventControllerLegacy()
+        legacy.connect("event", self.on_event)
+        self.area.add_controller(legacy)
+
+        if args.debug:
+            spy = Gtk.EventControllerLegacy(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+            spy.connect("event", self.on_debug_event)
+            self.add_controller(spy)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        self.buttons = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
+                               margin_bottom=48)
+        actions = [(_("btn_retry"), self.on_retry), (_("btn_quit"), lambda *_a: self.close())]
+        if not args.check:
+            actions.insert(0, (_("btn_apply"), self.on_apply))
+        for label, cb in actions:
+            b = Gtk.Button(label=label)
+            b.set_size_request(220, 72)
+            b.connect("clicked", cb)
+            self.buttons.append(b)
+        self.buttons.set_visible(False)
+        overlay.add_overlay(self.buttons)
+
+        self.fullscreen()
+
+    def reset_state(self):
+        self.state = self.COLLECT
+        self.index = 0
+        self.observed = []
+        self.samples = []
+        self.fit = None
+        self.residual_px = None
+        self.errors_px = []
+        self.test_points = []
+        self.message = None
+
+    # ---- geometry
+    def size(self):
+        return max(self.area.get_width(), 1), max(self.area.get_height(), 1)
+
+    def to_norm(self, x, y):
+        w, h = self.size()
+        return x / w, y / h
+
+    # ---- input
+    def on_debug_event(self, ctrl, event):
+        # PyGObject may pass None for the GdkEvent argument; ask the controller.
+        event = event or ctrl.get_current_event()
+        if event is None:
+            return False
+        ok, x, y = event.get_position()
+        dev = event.get_device()
+        print(f"[debug] {event.get_event_type().value_nick} pos=({x:.0f},{y:.0f}) "
+              f"src={dev.get_source().value_nick if dev else None} area={self.size()}",
+              file=sys.stderr, flush=True)
+        return False
+
+    def on_event(self, ctrl, event):
+        event = event or ctrl.get_current_event()
+        if event is None:
+            return False
+        t = event.get_event_type()
+        if t not in (Gdk.EventType.TOUCH_BEGIN, Gdk.EventType.TOUCH_UPDATE,
+                     Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            return False
+        ok, x, y = event.get_position()
+        if not ok:
+            return True
+        if t == Gdk.EventType.TOUCH_BEGIN:
+            self.samples = [(x, y)]
+        elif t == Gdk.EventType.TOUCH_UPDATE:
+            self.samples.append((x, y))
+        elif t == Gdk.EventType.TOUCH_END:
+            self.samples.append((x, y))
+            self.on_touch(self.median(self.samples))
+            self.samples = []
+        else:
+            self.samples = []
+        self.area.queue_draw()
+        return True
+
+    @staticmethod
+    def median(pts):
+        xs = sorted(p[0] for p in pts)
+        ys = sorted(p[1] for p in pts)
+        return xs[len(xs) // 2], ys[len(ys) // 2]
+
+    def on_touch(self, pos):
+        if self.state == self.COLLECT:
+            self.observed.append(self.to_norm(*pos))
+            self.index += 1
+            if self.index == len(self.targets):
+                self.finish_collect()
+        elif self.state == self.VERIFY:
+            raw = self.to_norm(*pos)
+            fixed = apply_affine(self.fit, *raw) if self.fit and not self.args.check else None
+            self.test_points = (self.test_points + [(raw, fixed)])[-8:]
+
+    def finish_collect(self):
+        w, h = self.size()
+        # Error of the touches as they land now, i.e. with the current matrix.
+        self.errors_px = [math.hypot((ox - tx) * w, (oy - ty) * h)
+                          for (ox, oy), (tx, ty) in zip(self.observed, self.targets)]
+        hw = [apply_affine(self.to_hw, *o) for o in self.observed]
+        try:
+            self.new_transform, self.new_scale, self.residual_px = fit_calibration(hw, self.targets, w, h)
+        except ValueError:
+            self.message = _("fit_failed")
+            self.state = self.VERIFY
+            self.buttons.set_visible(True)
+            return
+        # Current screen position -> where it lands with the new settings.
+        self.fit = compose(compose(TRANSFORMS[self.new_transform], scale_affine(self.new_scale)),
+                           self.to_hw)
+        self.state = self.VERIFY
+        self.buttons.set_visible(True)
+        if self.args.check:
+            self.print_check_report()
+
+    def check_summary(self):
+        # Judge by what a recalibration would gain rather than by absolute error:
+        # finger touches scatter by a few mm, which no correction can remove.
+        e = self.errors_px
+        mean, worst = sum(e) / len(e), max(e)
+        rms = math.sqrt(sum(v * v for v in e) / len(e))
+        if self.residual_px is None:
+            verdict = _("verdict_unknown")
+        elif rms - self.residual_px < max(2.0, 0.25 * rms):
+            verdict = _("verdict_good")
+        else:
+            verdict = _("verdict_improve", rms=rms, fit=self.residual_px)
+        return mean, worst, rms, verdict
+
+    def print_check_report(self):
+        mean, worst, rms, verdict = self.check_summary()
+        w, h = self.size()
+        print(f"device: /dev/input/{self.device[0]}  ({self.device[1]})")
+        print(f"current: {fmt_setting(self.cur_transform, self.cur_scale)}")
+        for (tx, ty), (ox, oy), e in zip(self.targets, self.observed, self.errors_px):
+            print(f"  target ({tx * w:6.0f},{ty * h:6.0f})  touch ({ox * w:6.0f},{oy * h:6.0f})"
+                  f"  error {e:5.1f} px")
+        print(f"mean {mean:.1f} px  max {worst:.1f} px  RMS {rms:.1f} px  -> {verdict}")
+        if self.residual_px is not None:
+            print(f"estimated after recalibration (RMS): {self.residual_px:.1f} px"
+                  f"  ({fmt_setting(self.new_transform, self.new_scale)})")
+
+    def on_key(self, _ctrl, keyval, _code, _mods):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+        elif keyval in (Gdk.KEY_r, Gdk.KEY_R):
+            self.on_retry()
+        elif keyval == Gdk.KEY_BackSpace and self.state == self.COLLECT and self.index:
+            self.index -= 1
+            self.observed.pop()
+        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self.state == self.VERIFY:
+            self.on_apply()
+        else:
+            return False
+        self.area.queue_draw()
+        return True
+
+    def on_retry(self, *_):
+        self.reset_state()
+        self.buttons.set_visible(False)
+        self.area.queue_draw()
+
+    def on_apply(self, *_):
+        if self.args.check or self.state != self.VERIFY or not self.fit:
+            return
+        print(f"input:touchdevice:transform = {self.new_transform}")
+        print(f"axis scale (sx cx sy cy) = {fmt_scale(self.new_scale)}")
+        if self.args.dry_run:
+            self.message = _("dry_run")
+        else:
+            ok, msg = run_helper("apply", self.device[0], *fmt_scale(self.new_scale).split())
+            if ok:
+                ok, err = set_hypr_transform(self.new_transform)
+                msg = err or msg
+            self.message = msg
+            if ok:
+                self.state = self.DONE
+                self.buttons.set_visible(False)
+                GLib.timeout_add_seconds(4, lambda: self.close() or False)
+        self.area.queue_draw()
+
+    # ---- drawing
+    def on_draw(self, _area, cr, w, h):
+        cr.set_source_rgb(0.08, 0.08, 0.10)
+        cr.paint()
+
+        if not self.device:
+            self.text(cr, w / 2, h / 2, _("no_touchscreen"), 24)
+            return
+
+        if self.state == self.COLLECT:
+            tx, ty = self.targets[self.index]
+            self.crosshair(cr, tx * w, ty * h, (1.0, 0.35, 0.3), 36)
+            if self.args.check:
+                self.text(cr, w / 2, h / 2 - (40 if (tx, ty) != (0.5, 0.5) else -50),
+                          _("check_banner"), 16, color=(0.5, 0.8, 1.0))
+            self.text(cr, w / 2, h / 2 + (0 if (tx, ty) != (0.5, 0.5) else 90),
+                      _("touch_target", n=self.index + 1, total=len(self.targets)), 22)
+            self.text(cr, w / 2, h / 2 + (40 if (tx, ty) != (0.5, 0.5) else 130),
+                      _("collect_keys"), 15, alpha=0.6)
+            if self.samples:
+                x, y = self.samples[-1]
+                cr.set_source_rgba(1, 1, 1, 0.5)
+                cr.arc(x, y, 10, 0, 2 * math.pi)
+                cr.fill()
+            return
+
+        # Verify / done: show all targets and live corrected test touches.
+        for tx, ty in self.targets:
+            self.crosshair(cr, tx * w, ty * h, (0.5, 0.5, 0.55), 20)
+        for (rx, ry), fixed in self.test_points:
+            cr.set_source_rgba(0.6, 0.6, 0.6, 0.8)
+            cr.arc(rx * w, ry * h, 6, 0, 2 * math.pi)
+            cr.fill()
+            if fixed:
+                cr.set_source_rgb(0.3, 0.9, 0.4)
+                cr.arc(fixed[0] * w, fixed[1] * h, 9, 0, 2 * math.pi)
+                cr.fill()
+
+        y0 = h * 0.30
+        if self.args.check:
+            self.draw_check(cr, w, h, y0)
+        elif self.state == self.DONE:
+            self.text(cr, w / 2, y0, _("applied"), 26)
+        else:
+            self.text(cr, w / 2, y0, _("verify_title"), 20)
+            self.text(cr, w / 2, y0 + 32, _("verify_legend"), 15, alpha=0.7)
+            if self.residual_px is not None:
+                self.text(cr, w / 2, y0 + 64, _("fit_error", fit=self.residual_px), 15, alpha=0.7)
+                self.text(cr, w / 2, y0 + 90,
+                          _("new_setting", setting=fmt_setting(self.new_transform, self.new_scale)), 13, alpha=0.6)
+        if self.message:
+            self.text(cr, w / 2, y0 + 150, self.message, 16, color=(1, 0.85, 0.4))
+
+    def draw_check(self, cr, w, h, y0):
+        # Where each target touch actually landed, with its error.
+        for (tx, ty), (ox, oy), e in zip(self.targets, self.observed, self.errors_px):
+            cr.set_source_rgba(1.0, 0.45, 0.35, 0.9)
+            cr.set_line_width(2)
+            cr.move_to(tx * w, ty * h)
+            cr.line_to(ox * w, oy * h)
+            cr.stroke()
+            cr.arc(ox * w, oy * h, 6, 0, 2 * math.pi)
+            cr.fill()
+            self.text(cr, tx * w, ty * h + 44, f"{e:.1f} px", 14, alpha=0.8)
+
+        self.text(cr, w / 2, y0, _("check_title"), 20, color=(0.5, 0.8, 1.0))
+        if self.errors_px:
+            mean, worst, rms, verdict = self.check_summary()
+            self.text(cr, w / 2, y0 + 32,
+                      _("check_stats", mean=mean, worst=worst, rms=rms, verdict=verdict), 18)
+        if self.residual_px is not None:
+            self.text(cr, w / 2, y0 + 64,
+                      _("check_estimate", fit=self.residual_px), 15, alpha=0.7)
+        self.text(cr, w / 2, y0 + 90,
+                  _("current_setting", setting=fmt_setting(self.cur_transform, self.cur_scale)), 13, alpha=0.6)
+        self.text(cr, w / 2, y0 + 116, _("check_legend"),
+                  14, alpha=0.7)
+        if self.message:
+            self.text(cr, w / 2, y0 + 176, self.message, 16, color=(1, 0.85, 0.4))
+
+    @staticmethod
+    def crosshair(cr, x, y, rgb, r):
+        cr.set_source_rgb(*rgb)
+        cr.set_line_width(2)
+        cr.move_to(x - r, y)
+        cr.line_to(x + r, y)
+        cr.move_to(x, y - r)
+        cr.line_to(x, y + r)
+        cr.stroke()
+        cr.arc(x, y, r * 0.45, 0, 2 * math.pi)
+        cr.stroke()
+        cr.arc(x, y, 2.5, 0, 2 * math.pi)
+        cr.fill()
+
+    @staticmethod
+    def text(cr, x, y, s, size, alpha=1.0, color=(1, 1, 1)):
+        cr.select_font_face("Sans")
+        cr.set_font_size(size)
+        ext = cr.text_extents(s)
+        cr.set_source_rgba(*color, alpha)
+        cr.move_to(x - ext.width / 2 - ext.x_bearing, y)
+        cr.show_text(s)
+
+
+# ---------------------------------------------------------------- helper ---
+
+def helper_path():
+    for p in APPLY_HELPER_CANDIDATES:
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def run_helper(*argv):
+    helper = helper_path()
+    if not helper:
+        return False, _("no_helper")
+    cmd = ([helper] if os.geteuid() == 0 else ["pkexec", helper]) + list(argv)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        return False, _("helper_failed", code=r.returncode, output=out.splitlines()[-1] if out else "")
+    return True, out.splitlines()[-1] if out else "OK"
+
+
+def main():
+    p = argparse.ArgumentParser(description="Touchscreen calibrator for GPD Pocket 3 on Hyprland")
+    p.add_argument("--points", type=int, choices=(5, 9), default=5, help="number of targets")
+    p.add_argument("--device", help="input event node to use, e.g. event14")
+    p.add_argument("--dry-run", action="store_true", help="print the matrix instead of installing it")
+    p.add_argument("--reset", action="store_true", help="remove the installed calibration and exit")
+    p.add_argument("--debug", action="store_true", help="log every input event to stderr")
+    p.add_argument("--show", action="store_true", help="show the detected device and current matrix")
+    p.add_argument("--lang", choices=("en", "ja"),
+                   help="UI language (default: from LC_ALL / LC_MESSAGES / LANG)")
+    p.add_argument("--check", action="store_true",
+                   help="touch the targets to measure the current calibration error without changing it")
+    args = p.parse_args()
+    if args.lang:
+        global LANGUAGE
+        LANGUAGE = args.lang
+
+    if args.show or args.reset:
+        dev = find_touchscreen(args.device)
+        if not dev:
+            sys.exit("touchscreen not found")
+        print(f"device: /dev/input/{dev[0]}  ({dev[1]})")
+        print(f"current: {fmt_setting(hyprland_touch_transform(), installed_scale())}")
+        if dev[2].get("LIBINPUT_CALIBRATION_MATRIX"):
+            print("note: LIBINPUT_CALIBRATION_MATRIX is set but Hyprland overrides it")
+        if args.reset:
+            ok, msg = run_helper("reset", dev[0])
+            print(msg)
+            errors = remove_hypr_transform() if ok else ""
+            if errors:
+                print("Hyprland config errors:", errors)
+            sys.exit(0 if ok and not errors else 1)
+        return
+
+    app = Gtk.Application(application_id="dev.local.GpdTouchCalibrator")
+    app.connect("activate", lambda a: Calibrator(a, args).present())
+    app.run([])
+
+
+if __name__ == "__main__":
+    main()
