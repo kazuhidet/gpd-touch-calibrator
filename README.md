@@ -16,6 +16,8 @@ matrix even when `transform` isn't set, so a udev `LIBINPUT_CALIBRATION_MATRIX` 
 The tool therefore leaves rotation to Hyprland and does the fine correction below libinput
 (the axis ranges). A slight skew (shear) cannot be corrected.
 
+![Check mode screen](preview.png)
+
 ## Usage
 
 ```bash
@@ -39,6 +41,10 @@ error and the estimated error after recalibrating (also printed to stdout). Ther
 button. The verdict is based on how much a recalibration would gain, not on the absolute error
 ("Good" when the gain is under 2 px and under 25% of the current RMS): finger touches scatter by
 a few millimeters, which no correction can remove.
+
+A touch that the other touches' fit misses by more than 40 px (and 3× that fit's own error) is
+treated as a slip: its target is circled in yellow and you are asked to retry. Use `--points 9`
+for this; with 5 points only about half of the slips can be told apart.
 
 The UI language is set with `--lang`. Without it, Japanese is used when `LC_ALL` /
 `LC_MESSAGES` / `LANG` starts with `ja`, English otherwise.
