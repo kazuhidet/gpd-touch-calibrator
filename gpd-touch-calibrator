@@ -71,6 +71,10 @@ MESSAGES = {
                      "良好（再キャリブレーションしても改善しません）"),
     "verdict_improve": ("Recalibration would improve it (RMS {rms:.1f} → {fit:.1f} px)",
                         "再キャリブレーションで改善します（RMS {rms:.1f} → {fit:.1f} px）"),
+    "verdict_outlier": ("Some touches look like slips (yellow). Press R to retry",
+                        "外れたタッチがあります（黄色）。R でやり直してください"),
+    "outlier_warning": ("Some touches look like slips (yellow) and skew the fit. Press R to retry",
+                        "外れたタッチがあります（黄色）。補正がずれるので R でやり直してください"),
     "dry_run": ("--dry-run: not applied (settings printed to stdout)",
                 "--dry-run: 適用はスキップしました（設定は標準出力に表示）"),
     "no_touchscreen": ("Touchscreen not found (Esc to quit)", "タッチスクリーンが見つかりません（Escで終了）"),
@@ -118,6 +122,11 @@ TRANSFORM_NAMES = ["0 (normal)", "1 (90°)", "2 (180°)", "3 (270°)",
                    "4 (flipped)", "5 (flipped+90°)", "6 (flipped+180°)"]
 
 TARGETS_5 = [(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9), (0.5, 0.5)]
+# A touch is a slip / mis-tap when a fit of the other touches misses it by
+# more than this many px and this many times that fit's own RMS error.
+OUTLIER_MIN_PX = 40.0
+OUTLIER_FACTOR = 3.0
+
 TARGETS_9 = [(x, y) for y in (0.08, 0.5, 0.92) for x in (0.08, 0.5, 0.92)]
 
 
@@ -272,6 +281,26 @@ def fit_calibration(hw, targets, w, h):
     return best
 
 
+def find_outliers(hw, targets, w, h):
+    """Indices of touches that a fit of all the other touches misses badly.
+
+    Comparing against the rest's own fit error (rather than the other misses)
+    keeps one slip from hiding itself by skewing every other leave-one-out fit.
+    """
+    outliers = []
+    for i in range(len(hw)):
+        rest = [k for k in range(len(hw)) if k != i]
+        try:
+            t, scale, rms = fit_calibration([hw[k] for k in rest], [targets[k] for k in rest], w, h)
+        except ValueError:
+            return []
+        u, v = apply_affine(compose(TRANSFORMS[t], scale_affine(scale)), *hw[i])
+        miss = math.hypot((u - targets[i][0]) * w, (v - targets[i][1]) * h)
+        if miss > max(OUTLIER_MIN_PX, OUTLIER_FACTOR * rms):
+            outliers.append(i)
+    return outliers
+
+
 def compose(a, b):
     """Return a∘b (apply b first, then a) for 2x3 affine matrices."""
     return [
@@ -326,8 +355,10 @@ class Calibrator(Gtk.ApplicationWindow):
         keys.connect("key-pressed", self.on_key)
         self.add_controller(keys)
 
-        self.buttons = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
-                               margin_bottom=48)
+        # Placed between the middle and bottom target rows (see on_resize) so
+        # no target is hidden behind the buttons.
+        self.buttons = Gtk.Box(spacing=24, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        self.area.connect("resize", self.on_resize)
         actions = [(_("btn_retry"), self.on_retry), (_("btn_quit"), lambda *_a: self.close())]
         if not args.check:
             actions.insert(0, (_("btn_apply"), self.on_apply))
@@ -349,10 +380,16 @@ class Calibrator(Gtk.ApplicationWindow):
         self.fit = None
         self.residual_px = None
         self.errors_px = []
+        self.outliers = []
         self.test_points = []
         self.message = None
 
     # ---- geometry
+    def on_resize(self, _area, _w, h):
+        # A centered widget is shifted down by half its top margin: center the
+        # buttons at 71% of the height.
+        self.buttons.set_margin_top(int(h * 0.42))
+
     def size(self):
         return max(self.area.get_width(), 1), max(self.area.get_height(), 1)
 
@@ -430,6 +467,9 @@ class Calibrator(Gtk.ApplicationWindow):
         # Current screen position -> where it lands with the new settings.
         self.fit = compose(compose(TRANSFORMS[self.new_transform], scale_affine(self.new_scale)),
                            self.to_hw)
+        self.outliers = find_outliers(hw, self.targets, w, h)
+        if self.outliers and not self.args.check:
+            self.message = _("outlier_warning")
         self.state = self.VERIFY
         self.buttons.set_visible(True)
         if self.args.check:
@@ -443,6 +483,8 @@ class Calibrator(Gtk.ApplicationWindow):
         rms = math.sqrt(sum(v * v for v in e) / len(e))
         if self.residual_px is None:
             verdict = _("verdict_unknown")
+        elif self.outliers:
+            verdict = _("verdict_outlier")
         elif rms - self.residual_px < max(2.0, 0.25 * rms):
             verdict = _("verdict_good")
         else:
@@ -454,9 +496,9 @@ class Calibrator(Gtk.ApplicationWindow):
         w, h = self.size()
         print(f"device: /dev/input/{self.device[0]}  ({self.device[1]})")
         print(f"current: {fmt_setting(self.cur_transform, self.cur_scale)}")
-        for (tx, ty), (ox, oy), e in zip(self.targets, self.observed, self.errors_px):
+        for i, ((tx, ty), (ox, oy), e) in enumerate(zip(self.targets, self.observed, self.errors_px)):
             print(f"  target ({tx * w:6.0f},{ty * h:6.0f})  touch ({ox * w:6.0f},{oy * h:6.0f})"
-                  f"  error {e:5.1f} px")
+                  f"  error {e:5.1f} px" + ("  <- outlier" if i in self.outliers else ""))
         print(f"mean {mean:.1f} px  max {worst:.1f} px  RMS {rms:.1f} px  -> {verdict}")
         if self.residual_px is not None:
             print(f"estimated after recalibration (RMS): {self.residual_px:.1f} px"
@@ -528,8 +570,13 @@ class Calibrator(Gtk.ApplicationWindow):
             return
 
         # Verify / done: show all targets and live corrected test touches.
-        for tx, ty in self.targets:
+        for i, (tx, ty) in enumerate(self.targets):
             self.crosshair(cr, tx * w, ty * h, (0.5, 0.5, 0.55), 20)
+            if i in self.outliers:
+                cr.set_source_rgb(1.0, 0.8, 0.2)
+                cr.set_line_width(3)
+                cr.arc(tx * w, ty * h, 30, 0, 2 * math.pi)
+                cr.stroke()
         for (rx, ry), fixed in self.test_points:
             cr.set_source_rgba(0.6, 0.6, 0.6, 0.8)
             cr.arc(rx * w, ry * h, 6, 0, 2 * math.pi)
