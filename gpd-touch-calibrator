@@ -30,7 +30,9 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 APPLY_HELPER_CANDIDATES = [
@@ -595,12 +597,18 @@ class Calibrator(Gtk.ApplicationWindow):
 
     @staticmethod
     def text(cr, x, y, s, size, alpha=1.0, color=(1, 1, 1)):
-        cr.select_font_face("Sans")
-        cr.set_font_size(size)
-        ext = cr.text_extents(s)
+        # Pango rather than cairo's toy text API: it falls back to other fonts
+        # for glyphs the default face lacks (e.g. Japanese).
+        layout = PangoCairo.create_layout(cr)
+        desc = Pango.FontDescription.from_string("Sans")
+        desc.set_absolute_size(size * Pango.SCALE)
+        layout.set_font_description(desc)
+        layout.set_text(s, -1)
+        _ink, logical = layout.get_pixel_extents()
         cr.set_source_rgba(*color, alpha)
-        cr.move_to(x - ext.width / 2 - ext.x_bearing, y)
-        cr.show_text(s)
+        # y is the baseline, as with cairo's show_text.
+        cr.move_to(x - logical.width / 2 - logical.x, y - layout.get_baseline() / Pango.SCALE)
+        PangoCairo.show_layout(cr, layout)
 
 
 # ---------------------------------------------------------------- helper ---
